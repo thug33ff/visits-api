@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+import sys
+import os
+
+# Ajoute le dossier parent au path pour importer config et proto
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify
 import asyncio
@@ -9,7 +14,7 @@ from pymongo import MongoClient
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
-from config import REGION_CONFIG, DB_NAME, MONGO_URI, MAX_USAGE,LICENCE_API,LICENCE_ID,SCOPE
+from config import REGION_CONFIG, DB_NAME, MONGO_URI, MAX_USAGE, LICENCE_API, LICENCE_ID, SCOPE
 from proto import (
     GetPlayerPersonalShowReq_pb2,
     GetPlayerPersonalShowResp_pb2,
@@ -18,8 +23,13 @@ from proto import (
 
 app = Flask(__name__)
 
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
+# ✅ Timeout court pour serverless (évite de bloquer le cold start)
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
+    db = client[DB_NAME]
+except Exception as e:
+    print(f"MongoDB init error: {e}")
+    db = None
 
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
@@ -58,6 +68,8 @@ def get_account_id(token: str):
         return None
 
 def fetch_tokens(region):
+    if db is None:
+        return []
     config = REGION_CONFIG.get(region)
     if not config:
         return []
@@ -77,7 +89,7 @@ def parse_protobuf_response(data: bytes):
             "level": b.level or 0
         }
     except Exception as e:
-        app.logger.error(f"Protobuf error: {e}")
+        print(f"Protobuf error: {e}")
         return None
 
 async def get_header(token):
@@ -98,13 +110,13 @@ async def visit(session, url, token, uid, payload, sem):
         try:
             headers = await get_header(token)
 
-            async with session.post(url,headers=headers,data=payload,ssl=False,timeout=10) as resp:
+            async with session.post(url, headers=headers, data=payload, ssl=False, timeout=10) as resp:
                 if resp.status == 200:
                     return True, await resp.read()
                 return False, None
 
         except Exception as e:
-            app.logger.error(f"visit error {token[-5:]}: {e}")
+            print(f"visit error {token[-5:]}: {e}")
             return False, None
 
 async def send_until_success(tokens, uid, region, target_success=500):
@@ -130,7 +142,7 @@ async def send_until_success(tokens, uid, region, target_success=500):
             batch = min(target_success - success, len(tokens))
 
             tasks = [
-                visit(session,url,tokens[(sent+i)%len(tokens)],uid,payload,sem)
+                visit(session, url, tokens[(sent+i) % len(tokens)], uid, payload, sem)
                 for i in range(batch)
             ]
 
@@ -142,7 +154,7 @@ async def send_until_success(tokens, uid, region, target_success=500):
                         player_info = parse_protobuf_response(resp)
                         break
 
-            success += sum(1 for r,_ in results if r)
+            success += sum(1 for r, _ in results if r)
             sent += batch
 
             await asyncio.sleep(0.5)
@@ -159,11 +171,11 @@ async def send_friend_request(session, uid, url, token):
         payload = encrypt_aes(msg.SerializeToString())
         headers = await get_header(token)
 
-        async with session.post(url,headers=headers,data=payload,timeout=20) as resp:
+        async with session.post(url, headers=headers, data=payload, timeout=20) as resp:
             return resp.status == 200
 
     except Exception as e:
-        app.logger.error(f"friend error {token[-5:]}: {e}")
+        print(f"friend error {token[-5:]}: {e}")
         return False
 
 
@@ -180,8 +192,7 @@ def send_visits():
     }.items() if not v]
 
     if missing:
-        return jsonify({
-            "error": f"missing params: {', '.join(missing)}", }), 400
+        return jsonify({"error": f"missing params: {', '.join(missing)}"}), 400
 
     region = region.upper()
     if region not in REGION_CONFIG:
@@ -189,8 +200,6 @@ def send_visits():
 
     async def run():
         async with aiohttp.ClientSession() as session:
-
-            # 🔐 CHECK KEY
             if not await check_key(session, key):
                 return None
 
@@ -198,9 +207,7 @@ def send_visits():
             if not tokens:
                 return "no_tokens"
 
-            success, sent, info = await send_until_success(
-                tokens, uid, region, 500
-            )
+            success, sent, info = await send_until_success(tokens, uid, region, 500)
 
             if not info:
                 return "decode_failed"
@@ -215,10 +222,8 @@ def send_visits():
 
     if result is None:
         return jsonify({"error": "invalid key"}), 403
-
     if result == "no_tokens":
         return jsonify({"error": "no tokens"}), 500
-
     if result == "decode_failed":
         return jsonify({"error": "decode failed"}), 500
 
@@ -238,9 +243,8 @@ async def send_requests():
     }.items() if not v]
 
     if missing:
-        return jsonify({
-            "error": f"missing params: {', '.join(missing)}", }), 400
-    
+        return jsonify({"error": f"missing params: {', '.join(missing)}"}), 400
+
     region = region.upper()
     if region not in REGION_CONFIG:
         return jsonify({"error": "bad region"}), 400
@@ -248,8 +252,6 @@ async def send_requests():
     config = REGION_CONFIG[region]
 
     async with aiohttp.ClientSession() as session:
-
-        # 🔐 CHECK KEY
         if not await check_key(session, key):
             return jsonify({"error": "invalid key"}), 403
 
@@ -267,20 +269,15 @@ async def send_requests():
 
         payload = encrypt_aes(msg.SerializeToString())
 
-        for i in range(1, MAX_USAGE):
+        for i in range(1, min(MAX_USAGE, len(tokens))):
             try:
                 headers = await get_header(tokens[i])
-
-                async with session.post(
-                    url_visit,headers=headers,data=payload,timeout=10
-                ) as r:
-
+                async with session.post(url_visit, headers=headers, data=payload, timeout=10) as r:
                     if r.status == 200:
                         player_info = parse_protobuf_response(await r.read())
                         break
-
             except Exception as e:
-                app.logger.warning(f"token error {i}: {e}")
+                print(f"token error {i}: {e}")
 
         if not player_info:
             return jsonify({"error": "no player"}), 500
@@ -297,8 +294,8 @@ async def send_requests():
             "fail": len(results) - sum(results),
             **player_info
         })
-    
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=6059, debug=True)
+# ⚠️ Ne pas mettre app.run() ici, Vercel gère le serveur
+# if __name__ == "__main__":
+#     app.run(host="0.0.0.0", port=6059, debug=True)
