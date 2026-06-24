@@ -97,7 +97,7 @@ async def get_header(token):
         "Authorization": f"Bearer {token}",
         "X-Unity-Version": "2018.4.11f1",
         "X-GA": "v1 1",
-        "ReleaseVersion": "OB53",
+        "ReleaseVersion": "OB54",
         "Content-Type": "application/x-www-form-urlencoded",
         "Content-Length": "16",
         "User-Agent": "Dalvik/2.1.0 (Android 9)",
